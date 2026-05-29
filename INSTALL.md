@@ -42,13 +42,13 @@ Use this when the repo lives on the same machine as Claude Code.
 Push this repository to GitHub first, then anyone can install it:
 
 ```
-/plugin marketplace add <owner>/<repo>
+/plugin marketplace add putu-eka-mulyana/telegram-claude-code
 /plugin install telegram@telegram-plugin
 /reload-plugins
 ```
 
-Replace `<owner>/<repo>` with your fork, e.g. `tenzro/claude_plugins-telegram`.
-Full git URLs work too: `/plugin marketplace add https://github.com/<owner>/<repo>.git`.
+Replace `putu-eka-mulyana/telegram-claude-code` with your fork, e.g. `tenzro/claude_plugins-telegram`.
+Full git URLs work too: `/plugin marketplace add https://github.com/putu-eka-mulyana/telegram-claude-code.git`.
 
 > `source: "./"` in `marketplace.json` resolves against the repo root, so the
 > GitHub path requires that `marketplace.json` and `plugin.json` stay in

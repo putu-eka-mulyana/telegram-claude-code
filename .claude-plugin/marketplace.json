@@ -5,7 +5,8 @@
   "description": "Telegram channel for Claude Code — fork with multi-project routing, router failover, and an interactive session switcher.",
   "owner": {
     "name": "putu eka",
-    "email": "team@tenzro.com"
+    "email": "team@tenzro.com",
+    "url": "https://github.com/putu-eka-mulyana"
   },
   "plugins": [
     {

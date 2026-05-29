@@ -37,7 +37,7 @@ Claude Code at the repo and install:
 # from a local clone:
 /plugin marketplace add /path/to/claude_plugins-telegram
 # or, after pushing the fork to GitHub:
-/plugin marketplace add <owner>/<repo>
+/plugin marketplace add putu-eka-mulyana/telegram-claude-code
 
 /plugin install telegram@telegram-plugin
 /reload-plugins

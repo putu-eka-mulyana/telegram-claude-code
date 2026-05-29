@@ -24,7 +24,7 @@ dari marketplace resmi. Repo ini sudah membawa manifest marketplace sendiri
 # dari clone lokal:
 /plugin marketplace add /path/ke/claude_plugins-telegram
 # atau, setelah fork dipush ke GitHub:
-/plugin marketplace add <owner>/<repo>
+/plugin marketplace add putu-eka-mulyana/telegram-claude-code
 
 /plugin install telegram@telegram-plugin
 /reload-plugins
