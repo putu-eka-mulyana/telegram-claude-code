@@ -9,8 +9,15 @@ import {
   encodeRefreshCallback,
   encodeSessionCallback,
   encodeStartCallback,
+  matchProjectByDir,
   parseSelectionCallback,
 } from '../multi-project'
+
+const PROJECTS_FOR_DIR = [
+  { id: 'alpha', label: 'Alpha', workingDirectory: '/work/alpha', enabled: true as const },
+  { id: 'beta', label: 'Beta', workingDirectory: '/work/beta', enabled: true as const },
+  { id: 'nested', label: 'Nested', workingDirectory: '/work/alpha/packages/api', enabled: true as const },
+]
 
 function fixture(now: () => number = () => 1_000): MultiProjectState {
   const root = mkdtempSync(join(tmpdir(), 'telegram-router-'))
@@ -198,6 +205,32 @@ describe('MultiProjectState', () => {
     ])
     state.clearPermission('abcde')
     expect(state.resolvePermission('abcde')).toBeUndefined()
+  })
+})
+
+describe('matchProjectByDir (directory-based auto-detection)', () => {
+  test('matches the exact working directory', () => {
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/alpha')).toBe('alpha')
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/beta')).toBe('beta')
+  })
+
+  test('matches a directory nested under a project', () => {
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/beta/src/handlers')).toBe('beta')
+  })
+
+  test('prefers the most specific (longest) match for nested projects', () => {
+    // /work/alpha/packages/api is inside /work/alpha, but the nested project wins.
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/alpha/packages/api')).toBe('nested')
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/alpha/packages/api/lib')).toBe('nested')
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/alpha/web')).toBe('alpha')
+  })
+
+  test('returns undefined for an unrelated dir or a non-absolute / unexpanded value', () => {
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/gamma')).toBeUndefined()
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '${CLAUDE_PROJECT_DIR}')).toBeUndefined()
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '')).toBeUndefined()
+    // A sibling whose name merely shares a prefix must not match.
+    expect(matchProjectByDir(PROJECTS_FOR_DIR, '/work/alpha-staging')).toBeUndefined()
   })
 })
 

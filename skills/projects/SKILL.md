@@ -96,8 +96,31 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    - `launchCommand` = parsed `--launch` JSON array if provided (validate it's
      an array of non-empty strings); omit otherwise.
 5. Write back (2-space indent).
-6. Confirm, then tell the user how to start a session for it:
-   `TELEGRAM_PROJECT_ID=<id> TELEGRAM_SESSION_LABEL=terminal-1 claude --channels plugin:telegram@telegram-plugin`
+6. **Offer zero-config activation** (recommended): ask whether to write
+   `<workingDirectory>/.claude/settings.json` with
+   `{ "env": { "TELEGRAM_PROJECT_ID": "<id>" } }` (merge — Read first, preserve
+   any existing keys/env). With this file, simply running
+   `claude --channels plugin:telegram@telegram-plugin` inside that directory
+   auto-joins the project — no per-session env var needed. See the **Activation**
+   section below. This is the same as running `link <id>`.
+7. Confirm. The session can also be started explicitly without the settings
+   file: `TELEGRAM_PROJECT_ID=<id> claude --channels plugin:telegram@telegram-plugin`
+
+### `link <id>` — write per-project auto-activation
+
+Writes (or merges) `<workingDirectory>/.claude/settings.json` for the project so
+opening Claude in that directory auto-selects it.
+
+1. Look up `projects[<id>]` to get its `workingDirectory`. If missing, stop.
+2. `mkdir -p <workingDirectory>/.claude`.
+3. Read any existing `settings.json` there; merge `env.TELEGRAM_PROJECT_ID = <id>`
+   without dropping other keys. Write back (2-space indent).
+4. Confirm. Mention the user can commit it (shared) or use `.claude/settings.local.json` (gitignored, personal).
+
+### `unlink <id>`
+
+Remove `env.TELEGRAM_PROJECT_ID` from `<workingDirectory>/.claude/settings.json`
+(and the `env` object / file if it becomes empty).
 
 ### `enable <id>` / `disable <id>`
 
@@ -120,6 +143,27 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
    Start New Session button for that project.
 
 ---
+
+## Activation — how a session joins a project
+
+A session joins multi-project mode when it can resolve a project id. Resolution
+order at server startup:
+
+1. **`TELEGRAM_PROJECT_ID` env var** — explicit, highest priority. Set it on the
+   command line, or once per project via `.claude/settings.json` `env` (see
+   `link`). This is the **reliable, recommended** path.
+2. **Directory auto-detect** — if no env var, the server matches the session's
+   project directory (`CLAUDE_PROJECT_DIR`, else the dir passed through the
+   plugin's `.mcp.json`, else `PWD`) against each registered project's
+   `workingDirectory`; the most specific match wins. Best-effort — depends on
+   Claude Code exposing the project directory to the plugin process, which can
+   vary by version, so prefer method 1 for guaranteed behavior.
+
+If neither resolves, the session runs as a plain single-bot bridge.
+
+So the smoothest setup is: `add` each project (with its real absolute
+`workingDirectory`), `link` it, then just open
+`claude --channels plugin:telegram@telegram-plugin` in each project folder.
 
 ## Implementation notes
 

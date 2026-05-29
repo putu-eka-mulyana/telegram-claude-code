@@ -145,8 +145,30 @@ The file it manages:
 Session** button may run at once for a project; manual terminal sessions don't
 count. Set it to `0` to disable bot-launched sessions for that project.
 
-Start an initial session and any additional terminal sessions with a registered
-project ID:
+A session joins a project when it can resolve a project id. Two ways:
+
+**Recommended — set it once per project, then just open Claude there.** Add an
+`env` block to the project's `.claude/settings.json` (the `/telegram:projects link`
+command writes this for you):
+
+```json
+{ "env": { "TELEGRAM_PROJECT_ID": "billing" } }
+```
+
+After that, opening Claude in that directory auto-joins the project — no
+per-session env var:
+
+```sh
+cd /absolute/path/to/billing
+claude --channels plugin:telegram@telegram-plugin
+```
+
+The server also **auto-detects** the project by matching the directory Claude was
+opened in against each registered `workingDirectory` (best-effort — it depends on
+Claude Code exposing the project dir to the plugin process, which varies by
+version; the `settings.json` `env` method above is the guaranteed one).
+
+**Or set it explicitly per launch:**
 
 ```sh
 TELEGRAM_PROJECT_ID=billing TELEGRAM_SESSION_LABEL=terminal-1 \

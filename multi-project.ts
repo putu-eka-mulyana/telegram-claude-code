@@ -71,6 +71,37 @@ function validId(id: string): boolean {
   return ID_PATTERN.test(id)
 }
 
+// Read + validate the project registry without any of the side effects the
+// MultiProjectState constructor has (it mkdir's the router/ tree). Used both by
+// listProjects() and by directory-based auto-detection at startup.
+export function loadProjects(stateDir: string): Project[] {
+  const stored = readJson<StoredProjects>(join(stateDir, 'projects.json'), {})
+  return Object.entries(stored.projects ?? {})
+    .filter(([id, project]) => validId(id) && project.enabled === true)
+    .filter(([, project]) => (
+      typeof project.label === 'string'
+      && typeof project.workingDirectory === 'string'
+      && isAbsolute(project.workingDirectory)
+    ))
+    .map(([id, project]) => ({ ...project, id, enabled: true }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+}
+
+// Pick the registered project whose workingDirectory contains `dir` (exact, or
+// `dir` nested under it). The most specific (longest) match wins, so a project
+// nested inside another routes correctly. Non-absolute input (e.g. an
+// unexpanded "${CLAUDE_PROJECT_DIR}") matches nothing.
+export function matchProjectByDir(projects: Project[], dir: string): string | undefined {
+  if (typeof dir !== 'string' || !isAbsolute(dir)) return undefined
+  const matches = projects.filter(project => {
+    const base = project.workingDirectory.replace(/\/+$/, '')
+    return dir === base || dir.startsWith(base + '/')
+  })
+  if (matches.length === 0) return undefined
+  matches.sort((a, b) => b.workingDirectory.length - a.workingDirectory.length)
+  return matches[0]!.id
+}
+
 function requireId(id: string, name: string): void {
   if (!validId(id)) throw new Error(`Invalid ${name}`)
 }
@@ -178,16 +209,7 @@ export class MultiProjectState {
   }
 
   listProjects(): Project[] {
-    const stored = readJson<StoredProjects>(join(this.stateDir, 'projects.json'), {})
-    return Object.entries(stored.projects ?? {})
-      .filter(([id, project]) => validId(id) && project.enabled === true)
-      .filter(([, project]) => (
-        typeof project.label === 'string'
-        && typeof project.workingDirectory === 'string'
-        && isAbsolute(project.workingDirectory)
-      ))
-      .map(([id, project]) => ({ ...project, id, enabled: true }))
-      .sort((a, b) => a.label.localeCompare(b.label))
+    return loadProjects(this.stateDir)
   }
 
   registerSession(session: Omit<RegisteredSession, 'lastSeen'>): void {

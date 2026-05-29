@@ -29,6 +29,8 @@ import {
   encodeRefreshCallback,
   encodeSessionCallback,
   encodeStartCallback,
+  loadProjects,
+  matchProjectByDir,
   parseSelectionCallback,
 } from './multi-project'
 
@@ -50,7 +52,31 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
-const PROJECT_ID = process.env.TELEGRAM_PROJECT_ID
+
+// Which project this session belongs to. Explicit env wins; otherwise we try to
+// infer it from the directory Claude was opened in by matching against the
+// registered projects' workingDirectory — so "open claude in a registered
+// project dir" joins multi-project mode with no per-session env var.
+//   CLAUDE_PROJECT_DIR : set by Claude Code for plugin processes (when present)
+//   TELEGRAM_PROJECT_DIR : passed through our .mcp.json env interpolation
+//   PWD : last-resort fallback
+function autodetectProjectId(stateDir: string): string | undefined {
+  const dir = [
+    process.env.CLAUDE_PROJECT_DIR,
+    process.env.TELEGRAM_PROJECT_DIR,
+    process.env.PWD,
+  ].find(d => typeof d === 'string' && d.startsWith('/'))
+  if (!dir) return undefined
+  try {
+    const id = matchProjectByDir(loadProjects(stateDir), dir)
+    if (id) process.stderr.write(`telegram channel: auto-selected project '${id}' from directory ${dir}\n`)
+    return id
+  } catch {
+    return undefined
+  }
+}
+
+const PROJECT_ID = process.env.TELEGRAM_PROJECT_ID ?? autodetectProjectId(STATE_DIR)
 const SESSION_ORIGIN = process.env.TELEGRAM_SESSION_ORIGIN === 'managed' ? 'managed' : 'manual'
 const SESSION_ID = process.env.TELEGRAM_SESSION_ID ?? defaultSessionId(SESSION_ORIGIN, process.pid)
 const SESSION_LABEL = process.env.TELEGRAM_SESSION_LABEL ?? SESSION_ID

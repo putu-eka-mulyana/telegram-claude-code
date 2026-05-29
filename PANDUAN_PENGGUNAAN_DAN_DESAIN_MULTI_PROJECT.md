@@ -208,7 +208,28 @@ yang terdaftar pada `~/.claude/channels/telegram/projects.json`:
 }
 ```
 
-Contoh menjalankan connector manual:
+**Cara termudah (rekomendasi): set sekali per project, lalu cukup buka Claude di
+folder itu.** Tambahkan blok `env` ke `.claude/settings.json` project (perintah
+`/telegram:projects link <id>` menuliskannya otomatis):
+
+```json
+{ "env": { "TELEGRAM_PROJECT_ID": "billing" } }
+```
+
+Setelah itu, buka Claude di direktori tersebut langsung join project — tanpa env
+var manual:
+
+```bash
+cd /absolute/path/to/billing
+claude --channels plugin:telegram@telegram-plugin
+```
+
+Server juga melakukan **auto-detect**: mencocokkan direktori tempat Claude dibuka
+dengan `workingDirectory` tiap project terdaftar (best-effort — bergantung apakah
+Claude Code mengekspos direktori project ke proses plugin, bisa berbeda
+antar-versi; metode `settings.json` `env` di atas yang dijamin).
+
+Atau set eksplisit tiap launch:
 
 ```bash
 TELEGRAM_PROJECT_ID=billing TELEGRAM_SESSION_LABEL=terminal-1 \
