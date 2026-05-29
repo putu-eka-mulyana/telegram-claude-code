@@ -1,0 +1,12 @@
+node_modules/
+
+# Local tool config — symlink ke Gemini/AI config pribadi, bukan bagian plugin
+.antigravitycli/
+
+# Local plans/internal docs — bukan bagian distributable plugin
+docs/
+
+# Kalau seseorang tidak sengaja set TELEGRAM_STATE_DIR ke dalam repo,
+# pastikan credential dan state tidak ikut commit
+*.env
+.env*

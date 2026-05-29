@@ -4,6 +4,13 @@ Connect a Telegram bot to your Claude Code with an MCP server.
 
 The MCP server logs into Telegram as a bot and provides tools to Claude to reply, react, or edit messages. When you message the bot, the server forwards the message to your Claude Code session.
 
+> **This is a fork** of the official Anthropic `telegram` plugin, adding
+> multi-project routing, router failover, an interactive session switcher, and a
+> `/telegram:projects` registry skill. It is **not** installed from the official
+> marketplace — see **[INSTALL.md](./INSTALL.md)** for fork install steps (local
+> clone or GitHub). The marketplace identifier is `telegram-plugin`, so the
+> install command is `/plugin install telegram@telegram-plugin`.
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
@@ -22,13 +29,22 @@ BotFather replies with a token that looks like `123456789:AAHfiqksKZ8...` — th
 
 **2. Install the plugin.**
 
-These are Claude Code commands — run `claude` to start a session first.
+These are Claude Code commands — run `claude` to start a session first. This
+fork ships its own marketplace manifest (`name: telegram-plugin`), so point
+Claude Code at the repo and install:
 
-Install the plugin:
 ```
-/plugin install telegram@claude-plugins-official
+# from a local clone:
+/plugin marketplace add /path/to/claude_plugins-telegram
+# or, after pushing the fork to GitHub:
+/plugin marketplace add <owner>/<repo>
+
+/plugin install telegram@telegram-plugin
 /reload-plugins
 ```
+
+The marketplace identifier (`telegram-plugin`) is the same whether you add it
+locally or from GitHub. Full steps and updating: **[INSTALL.md](./INSTALL.md)**.
 
 **3. Give the server the token.**
 
@@ -45,7 +61,7 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 The server won't connect without this — exit your session and start a new one:
 
 ```sh
-claude --channels plugin:telegram@claude-plugins-official
+claude --channels plugin:telegram@telegram-plugin
 ```
 
 **5. Pair.**
@@ -87,6 +103,72 @@ Inbound photos are downloaded to `~/.claude/channels/telegram/inbox/` and the
 local path is included in the `<channel>` notification so the assistant can
 `Read` it. Telegram compresses photos — if you need the original file, send it
 as a document instead (long-press → Send as File).
+
+## Multi-project routing
+
+One bot can route messages to multiple running Claude Code sessions. All
+participating sessions use the same `TELEGRAM_STATE_DIR`; one process owns
+Telegram polling and the others act as session connectors.
+
+Register projects with the `/telegram:projects` skill (or hand-edit
+`~/.claude/channels/telegram/projects.json`):
+
+```
+/telegram:projects add billing /absolute/path/to/billing --label "Billing API"
+/telegram:projects                       # list registered projects
+/telegram:projects disable billing       # hide without deleting
+```
+
+The file it manages:
+
+```json
+{
+  "projects": {
+    "billing": {
+      "label": "Billing API",
+      "workingDirectory": "/absolute/path/to/billing",
+      "enabled": true,
+      "launchCommand": ["claude", "--channels", "plugin:telegram@telegram-plugin"],
+      "maxManagedSessions": 3
+    }
+  }
+}
+```
+
+`maxManagedSessions` (default 3) caps how many sessions the **Start New
+Session** button may run at once for a project; manual terminal sessions don't
+count. Set it to `0` to disable bot-launched sessions for that project.
+
+Start an initial session and any additional terminal sessions with a registered
+project ID:
+
+```sh
+TELEGRAM_PROJECT_ID=billing TELEGRAM_SESSION_LABEL=terminal-1 \
+  claude --channels plugin:telegram@telegram-plugin
+```
+
+Optional variables are `TELEGRAM_SESSION_ID` and
+`TELEGRAM_SESSION_ORIGIN=manual|managed`. In Telegram, send `/project_list`,
+choose a project (the button shows how many sessions are online), then choose a
+live session (labeled with origin and last-active age). The selection is stored
+per chat; later messages are delivered only to that selected session. After
+selecting, the confirmation offers **Ganti Session**, **Ganti Project**, and
+**Status** buttons so you can switch target or check the active binding without
+retyping `/project_list`. When a project has a configured `launchCommand`, its
+session screen also includes `Start New Session`; press `Refresh Sessions`
+after the new connector starts. Session IDs are scoped to their project, so two
+projects may both expose a session named `terminal-1`.
+
+If you switch a chat to a different session while an earlier one is still
+working, the late reply from that earlier session is prefixed with its origin
+(`[Project / session]`) so parallel answers stay attributable; the
+currently-bound session replies without a prefix.
+
+Only the router process polls the shared bot token. If the router session
+exits, the next heartbeat promotes a surviving connector to router
+automatically — the bot keeps responding as long as at least one session is
+alive. Do not run the same token with different state directories for this
+mode; Telegram permits one `getUpdates` consumer per token.
 
 ## No history or search
 

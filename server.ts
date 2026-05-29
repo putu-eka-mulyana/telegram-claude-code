@@ -22,6 +22,15 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
+import {
+  MultiProjectState,
+  defaultSessionId,
+  encodeProjectCallback,
+  encodeRefreshCallback,
+  encodeSessionCallback,
+  encodeStartCallback,
+  parseSelectionCallback,
+} from './multi-project'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -41,6 +50,11 @@ try {
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN
 const STATIC = process.env.TELEGRAM_ACCESS_MODE === 'static'
+const PROJECT_ID = process.env.TELEGRAM_PROJECT_ID
+const SESSION_ORIGIN = process.env.TELEGRAM_SESSION_ORIGIN === 'managed' ? 'managed' : 'manual'
+const SESSION_ID = process.env.TELEGRAM_SESSION_ID ?? defaultSessionId(SESSION_ORIGIN, process.pid)
+const SESSION_LABEL = process.env.TELEGRAM_SESSION_LABEL ?? SESSION_ID
+const multiProject = PROJECT_ID ? new MultiProjectState(STATE_DIR) : undefined
 
 if (!TOKEN) {
   process.stderr.write(
@@ -52,21 +66,39 @@ if (!TOKEN) {
 }
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+if (multiProject && !multiProject.listProjects().some(project => project.id === PROJECT_ID)) {
+  process.stderr.write(`telegram channel: TELEGRAM_PROJECT_ID is not enabled in projects.json: ${PROJECT_ID}\n`)
+  process.exit(1)
+}
+if (multiProject) {
+  multiProject.registerSession({
+    id: SESSION_ID,
+    projectId: PROJECT_ID!,
+    label: SESSION_LABEL,
+    origin: SESSION_ORIGIN,
+    pid: process.pid,
+  })
+}
+// Mutable: a connector can be promoted to router later if the original router
+// exits (failover). Single-project mode is always its own router.
+let isRouter = multiProject ? multiProject.claimPoller(process.pid) === 'router' : true
 
 // Telegram allows exactly one getUpdates consumer per token. If a previous
 // session crashed (SIGKILL, terminal closed) its server.ts grandchild can
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-try {
-  const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
-  if (stale > 1 && stale !== process.pid) {
-    process.kill(stale, 0)
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-  }
-} catch {}
-writeFileSync(PID_FILE, String(process.pid))
+if (!multiProject) {
+  try {
+    const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
+    if (stale > 1 && stale !== process.pid) {
+      process.kill(stale, 0)
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+    }
+  } catch {}
+  writeFileSync(PID_FILE, String(process.pid))
+}
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -428,10 +460,12 @@ mcp.setNotificationHandler(
   async ({ params }) => {
     const { request_id, tool_name, description, input_preview } = params
     pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    if (multiProject) multiProject.bindPermission(request_id, PROJECT_ID!, SESSION_ID)
     const access = loadAccess()
     const text = `🔐 Permission: ${tool_name}`
     const keyboard = new InlineKeyboard()
-      .text('See more', `perm:more:${request_id}`)
+    if (!multiProject) keyboard.text('See more', `perm:more:${request_id}`)
+    keyboard
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
     for (const chat_id of access.allowFrom) {
@@ -542,7 +576,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
         const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
+
+        // In multi-project mode, if the chat has since switched to a different
+        // target, prefix the reply with this session's origin so a late/parallel
+        // answer is attributable instead of looking like the active session.
+        let outText = text
+        if (multiProject && PROJECT_ID && multiProject.shouldLabelResponse(chat_id, PROJECT_ID, SESSION_ID)) {
+          const projectLabel = multiProject.listProjects().find(p => p.id === PROJECT_ID)?.label ?? PROJECT_ID
+          outText = `[${projectLabel} / ${SESSION_LABEL}]\n${text}`
+        }
+        const chunks = chunk(outText, limit, mode)
         const sentIds: number[] = []
 
         try {
@@ -642,6 +685,36 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
+if (multiProject) {
+  setInterval(() => {
+    // Failover: if we're a connector and the poller slot is free (router exited
+    // or its pid is dead), claim it and start polling. claimPoller uses an
+    // exclusive create, so only one connector wins the promotion.
+    if (!isRouter && !shuttingDown && multiProject!.claimPoller(process.pid) === 'router') {
+      isRouter = true
+      process.stderr.write(`telegram channel: promoted to router (previous router exited)\n`)
+      startPolling()
+    }
+    multiProject.heartbeat(PROJECT_ID!, SESSION_ID)
+    for (const queued of multiProject.drain(PROJECT_ID!, SESSION_ID)) {
+      void mcp.notification({
+        method: 'notifications/claude/channel',
+        params: queued,
+      }).catch(err => {
+        process.stderr.write(`telegram channel: failed to deliver queued inbound: ${err}\n`)
+      })
+    }
+    for (const queued of multiProject.drainPermissions(PROJECT_ID!, SESSION_ID)) {
+      void mcp.notification({
+        method: 'notifications/claude/channel/permission',
+        params: queued,
+      }).catch(err => {
+        process.stderr.write(`telegram channel: failed to deliver queued permission: ${err}\n`)
+      })
+    }
+  }, 1000).unref()
+}
+
 // When Claude Code closes the MCP connection, stdin gets EOF. Without this
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
@@ -650,9 +723,13 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('telegram channel: shutting down\n')
-  try {
-    if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
-  } catch {}
+  if (multiProject) {
+    multiProject.releasePoller(process.pid)
+  } else {
+    try {
+      if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) rmSync(PID_FILE)
+    } catch {}
+  }
   // bot.stop() signals the poll loop to end; the current getUpdates request
   // may take up to its long-poll timeout to return. Force-exit after 2s.
   setTimeout(() => process.exit(0), 2000)
@@ -725,11 +802,197 @@ bot.command('status', async ctx => {
   await ctx.reply(`Not paired. Send me a message to get a pairing code.`)
 })
 
+function projectKeyboard(): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
+  for (const project of multiProject?.listProjects() ?? []) {
+    const online = multiProject?.listSessions(project.id).length ?? 0
+    const suffix = online > 0 ? `${online} session online` : 'offline'
+    keyboard.text(`${project.label} · ${suffix}`, encodeProjectCallback(project.id)).row()
+  }
+  return keyboard
+}
+
+// Relative "last active" label from a session heartbeat timestamp.
+function ageLabel(lastSeen: number): string {
+  const secs = Math.max(0, Math.round((Date.now() - lastSeen) / 1000))
+  return secs < 5 ? 'baru saja' : `aktif ${secs}s lalu`
+}
+
+function sessionKeyboard(projectId: string): InlineKeyboard {
+  const keyboard = new InlineKeyboard()
+  for (const session of multiProject?.listSessions(projectId) ?? []) {
+    keyboard.text(
+      `${session.label} · ${session.origin} · ${ageLabel(session.lastSeen)}`,
+      encodeSessionCallback(projectId, session.id),
+    ).row()
+  }
+  if (multiProject?.getLaunchSpec(projectId)) {
+    keyboard.text('+ Start New Session', encodeStartCallback(projectId)).row()
+  }
+  keyboard.text('🔄 Refresh Sessions', encodeRefreshCallback(projectId)).row()
+  keyboard.text('< Back to Projects', 'projects:list')
+  return keyboard
+}
+
+// Shown under the "target active" confirmation so the user can switch or check
+// status without retyping /project_list.
+function activeTargetKeyboard(projectId: string): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🔁 Ganti Session', encodeRefreshCallback(projectId))
+    .text('📂 Ganti Project', 'projects:list')
+    .row()
+    .text('ℹ️ Status', 'status:show')
+}
+
+function deliverPermission(request_id: string, behavior: 'allow' | 'deny'): void {
+  const target = multiProject?.resolvePermission(request_id)
+  if (
+    multiProject
+    && target
+    && (target.projectId !== PROJECT_ID || target.sessionId !== SESSION_ID)
+  ) {
+    multiProject.enqueuePermission(target.projectId, target.sessionId, { request_id, behavior })
+  } else {
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id, behavior },
+    })
+  }
+  multiProject?.clearPermission(request_id)
+}
+
+function projectNavigationAllowed(ctx: Context): boolean {
+  const gated = dmCommandGate(ctx)
+  return !!gated && gated.access.allowFrom.includes(gated.senderId)
+}
+
+bot.command('project_list', async ctx => {
+  if (!multiProject || !projectNavigationAllowed(ctx)) return
+  if (multiProject.listProjects().length === 0) {
+    await ctx.reply(
+      'Belum ada project terdaftar. Tambahkan lewat /telegram:projects di terminal Claude Code, ' +
+      'lalu jalankan session dengan TELEGRAM_PROJECT_ID.',
+    )
+    return
+  }
+  await ctx.reply('Pilih project:', { reply_markup: projectKeyboard() })
+})
+
 // Inline-button handler for permission requests. Callback data is
 // `perm:allow:<id>`, `perm:deny:<id>`, or `perm:more:<id>`.
 // Security mirrors the text-reply path: allowFrom must contain the sender.
 bot.on('callback_query:data', async ctx => {
   const data = ctx.callbackQuery.data
+  if (data === 'projects:list') {
+    if (!multiProject || !projectNavigationAllowed(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    if (multiProject.listProjects().length === 0) {
+      await ctx.editMessageText('Belum ada project terdaftar. Tambahkan lewat /telegram:projects.').catch(() => {})
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+    await ctx.editMessageText('Pilih project:', { reply_markup: projectKeyboard() }).catch(() => {})
+    await ctx.answerCallbackQuery().catch(() => {})
+    return
+  }
+  if (data === 'status:show') {
+    if (!multiProject || !projectNavigationAllowed(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    const binding = multiProject.resolveBinding(String(ctx.chat!.id))
+    if (!binding) {
+      await ctx.answerCallbackQuery({ text: 'Belum ada target aktif. Pilih lewat /project_list.', show_alert: true }).catch(() => {})
+      return
+    }
+    const online = multiProject.listSessions(binding.project.id).length
+    await ctx.answerCallbackQuery({
+      text: `Target: ${binding.project.label} / ${binding.session.label}\n${online} session online di project ini.`,
+      show_alert: true,
+    }).catch(() => {})
+    return
+  }
+  const selection = parseSelectionCallback(data)
+  if (selection) {
+    if (!multiProject || !projectNavigationAllowed(ctx)) {
+      await ctx.answerCallbackQuery({ text: 'Not authorized.' }).catch(() => {})
+      return
+    }
+    if (selection.kind === 'project' || selection.kind === 'refresh') {
+      const project = multiProject.listProjects().find(item => item.id === selection.projectId)
+      if (!project) {
+        await ctx.answerCallbackQuery({ text: 'Project unavailable.' }).catch(() => {})
+        return
+      }
+      await ctx.editMessageText(`Project: ${project.label}\nPilih session:`, {
+        reply_markup: sessionKeyboard(project.id),
+      }).catch(() => {})
+      await ctx.answerCallbackQuery().catch(() => {})
+      return
+    }
+    if (selection.kind === 'start') {
+      const project = multiProject.listProjects().find(item => item.id === selection.projectId)
+      const launch = multiProject.getLaunchSpec(selection.projectId)
+      if (!project || !launch) {
+        await ctx.answerCallbackQuery({ text: 'Project tidak dapat dijalankan.' }).catch(() => {})
+        return
+      }
+      // Cap bot-launched sessions so repeated taps can't spawn unbounded
+      // Claude processes. Manual terminal sessions don't count toward this.
+      if (!multiProject.canStartManagedSession(selection.projectId)) {
+        await ctx.answerCallbackQuery({
+          text: `Batas managed session tercapai (maks ${multiProject.managedSessionLimit(selection.projectId)}). Tutup salah satu dulu.`,
+          show_alert: true,
+        }).catch(() => {})
+        return
+      }
+      try {
+        // Inherit our env but strip our own session identity — otherwise the
+        // child reuses the router's TELEGRAM_SESSION_ID/LABEL and collides with
+        // it in the registry. Cleared keys let the child compute a fresh
+        // managed-<pid> default.
+        const childEnv: Record<string, string | undefined> = { ...process.env }
+        delete childEnv.TELEGRAM_SESSION_ID
+        delete childEnv.TELEGRAM_SESSION_LABEL
+        childEnv.TELEGRAM_STATE_DIR = STATE_DIR
+        childEnv.TELEGRAM_PROJECT_ID = project.id
+        childEnv.TELEGRAM_SESSION_ORIGIN = 'managed'
+        const proc = Bun.spawn(launch.command, {
+          cwd: launch.workingDirectory,
+          env: childEnv,
+          stdin: 'ignore',
+          stdout: 'ignore',
+          stderr: 'inherit',
+        })
+        proc.unref()
+        await ctx.editMessageText(
+          `Memulai session untuk ${project.label}. Tekan Refresh Sessions setelah status online muncul.`,
+          { reply_markup: sessionKeyboard(project.id) },
+        ).catch(() => {})
+        await ctx.answerCallbackQuery({ text: 'Session sedang dimulai.' }).catch(() => {})
+      } catch (err) {
+        process.stderr.write(`telegram channel: failed to start managed session: ${err}\n`)
+        await ctx.answerCallbackQuery({ text: 'Gagal memulai session.' }).catch(() => {})
+      }
+      return
+    }
+    try {
+      multiProject.bindChat(String(ctx.chat!.id), selection.projectId, selection.sessionId)
+      const project = multiProject.listProjects().find(item => item.id === selection.projectId)!
+      const session = multiProject.listSessions(selection.projectId)
+        .find(item => item.id === selection.sessionId)!
+      await ctx.editMessageText(
+        `Target aktif: ${project.label} / ${session.label}\nKirim pesan untuk memprompt session ini.`,
+        { reply_markup: activeTargetKeyboard(selection.projectId) },
+      ).catch(() => {})
+      await ctx.answerCallbackQuery({ text: 'Target dipilih.' }).catch(() => {})
+    } catch {
+      await ctx.answerCallbackQuery({ text: 'Session sudah offline.' }).catch(() => {})
+    }
+    return
+  }
   const m = /^perm:(allow|deny|more):([a-km-z]{5})$/.exec(data)
   if (!m) {
     await ctx.answerCallbackQuery().catch(() => {})
@@ -769,10 +1032,7 @@ bot.on('callback_query:data', async ctx => {
     return
   }
 
-  void mcp.notification({
-    method: 'notifications/claude/channel/permission',
-    params: { request_id, behavior },
-  })
+  deliverPermission(request_id, behavior as 'allow' | 'deny')
   pendingPermissions.delete(request_id)
   const label = behavior === 'allow' ? '✅ Allowed' : '❌ Denied'
   await ctx.answerCallbackQuery({ text: label }).catch(() => {})
@@ -926,19 +1186,22 @@ async function handleInbound(
   // (non-allowlisted senders were dropped above), so we trust the reply.
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
-    void mcp.notification({
-      method: 'notifications/claude/channel/permission',
-      params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
-      },
-    })
+    deliverPermission(
+      permMatch[2]!.toLowerCase(),
+      permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+    )
     if (msgId != null) {
       const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '✅' : '❌'
       void bot.api.setMessageReaction(chat_id, msgId, [
         { type: 'emoji', emoji: emoji as ReactionTypeEmoji['emoji'] },
       ]).catch(() => {})
     }
+    return
+  }
+
+  const binding = multiProject?.resolveBinding(chat_id)
+  if (multiProject && !binding) {
+    await ctx.reply('Belum ada session aktif untuk chat ini. Gunakan /project_list untuk memilih project dan session.')
     return
   }
 
@@ -960,29 +1223,42 @@ async function handleInbound(
 
   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
   // annotation is forgeable by any allowlisted sender typing that string.
-  mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        chat_id,
-        ...(msgId != null ? { message_id: String(msgId) } : {}),
-        user: from.username ?? String(from.id),
-        user_id: String(from.id),
-        ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
-        ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
-          attachment_kind: attachment.kind,
-          attachment_file_id: attachment.file_id,
-          ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
-          ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
-          ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
-      },
+  const params = {
+    content: text,
+    meta: {
+      chat_id,
+      ...(msgId != null ? { message_id: String(msgId) } : {}),
+      user: from.username ?? String(from.id),
+      user_id: String(from.id),
+      ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
+      ...(binding ? {
+        project_id: binding.project.id,
+        session_id: binding.session.id,
+      } : {}),
+      ...(imagePath ? { image_path: imagePath } : {}),
+      ...(attachment ? {
+        attachment_kind: attachment.kind,
+        attachment_file_id: attachment.file_id,
+        ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
+        ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
+        ...(attachment.name ? { attachment_name: attachment.name } : {}),
+      } : {}),
     },
-  }).catch(err => {
-    process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
-  })
+  }
+  if (
+    multiProject
+    && binding
+    && (binding.project.id !== PROJECT_ID || binding.session.id !== SESSION_ID)
+  ) {
+    multiProject.enqueue(binding.project.id, binding.session.id, params)
+  } else {
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params,
+    }).catch(err => {
+      process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+    })
+  }
 }
 
 // Without this, any throw in a message handler stops polling permanently
@@ -996,7 +1272,11 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
-void (async () => {
+let pollingStarted = false
+function startPolling(): void {
+  if (pollingStarted || shuttingDown) return
+  pollingStarted = true
+  void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
@@ -1009,6 +1289,7 @@ void (async () => {
               { command: 'start', description: 'Welcome and setup guide' },
               { command: 'help', description: 'What this bot can do' },
               { command: 'status', description: 'Check your pairing status' },
+              ...(multiProject ? [{ command: 'project_list', description: 'Choose project and Claude session' }] : []),
             ],
             { scope: { type: 'all_private_chats' } },
           ).catch(() => {})
@@ -1035,4 +1316,13 @@ void (async () => {
       await new Promise(r => setTimeout(r, delay))
     }
   }
-})()
+  })()
+}
+
+// Boot dispatch. Router polls immediately; connectors wait — the multi-project
+// heartbeat loop promotes the first connector to router if the original exits.
+if (isRouter) {
+  startPolling()
+} else {
+  process.stderr.write(`telegram channel: connector session ${SESSION_ID} registered; Telegram polling owned by router\n`)
+}
