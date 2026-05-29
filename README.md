@@ -86,6 +86,12 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 Quick reference: IDs are **numeric user IDs** (get yours from [@userinfobot](https://t.me/userinfobot)). Default policy is `pairing`. `ackReaction` only accepts Telegram's fixed emoji whitelist.
 
+**Pause/resume without restarting:** `/telegram:bot off` drops all inbound
+messages (the bot goes silent); `/telegram:bot on` restores the previous
+policy. It edits `dmPolicy` in `access.json`, which the server re-reads live, so
+the toggle takes effect immediately. `/telegram:bot` with no argument reports
+on/off status.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |
